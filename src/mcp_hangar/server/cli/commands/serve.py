@@ -11,7 +11,8 @@ from typing import Annotated
 
 import typer
 
-from ..config_path import DEFAULT_RULE_HELP, resolve_config_path
+from ..config_path import DEFAULT_RULE_HELP, MissingConfigFileError, require_config_file, resolve_config_path
+from ..errors import CLIError
 
 
 def serve_command(
@@ -28,7 +29,7 @@ def serve_command(
         bool,
         typer.Option(
             "--http",
-            help="Run in HTTP mode instead of stdio",
+            help="Run in HTTP mode instead of stdio (MCP_MODE=http does the same)",
             is_flag=True,
         ),
     ] = False,
@@ -36,10 +37,10 @@ def serve_command(
         str,
         typer.Option(
             "--host",
-            help="HTTP server host",
+            help="HTTP server host (default: loopback; a non-loopback host needs auth)",
             envvar="MCP_HTTP_HOST",
         ),
-    ] = "0.0.0.0",
+    ] = "127.0.0.1",
     port: Annotated[
         int,
         typer.Option(
@@ -99,13 +100,20 @@ def serve_command(
     # `serve --config X` before `mcp-hangar --config X`, then the shared
     # default. The result is always a path: bootstrap watches the file it is
     # given, and with none every reload failed (#1657).
-    resolved_config = resolve_config_path(config, getattr(global_opts, "config", None)).path
+    resolved = resolve_config_path(config, getattr(global_opts, "config", None))
+    # Before anything starts: a missing file is fatal, never a demo config (#1650).
+    try:
+        resolved_config = require_config_file(resolved)
+    except MissingConfigFileError as e:
+        raise CLIError(message=e.message, exit_code=1) from e
 
     # Build CLIConfig for backward compatibility with existing server code
     from ..cli_compat import CLIConfig, env_enables_http_mode
 
     # Resolve http mode from environment if flag not set
     http_mode = http
+    # Read here, not bound to the flag: a bool option refuses `MCP_MODE=http` (#1660).
+    # The bool spellings the flag used to take stay accepted.
     if not http_mode and env_enables_http_mode(os.getenv("MCP_MODE")):
         http_mode = True
 
@@ -118,6 +126,7 @@ def serve_command(
         log_level=log_level.upper(),
         json_logs=json_logs,
         unsafe_no_auth=unsafe_no_auth,
+        config_source=resolved.source,
     )
 
     # Import and run the server

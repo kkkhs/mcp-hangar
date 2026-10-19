@@ -470,6 +470,12 @@ def _approval_policy(
     return None
 
 
+def _upstream_of(server: Any) -> str | None:
+    """The identity of the upstream *server* fronts, or None when it cannot say (#1802)."""
+    identity = getattr(server, "upstream_identity", None)
+    return identity() if callable(identity) else None
+
+
 @dataclass(frozen=True)
 class _Governance:
     """What governs one call, decided against one configuration's overlays (#1431).
@@ -737,6 +743,9 @@ class _CallPipeline:
     #: that returns None without a note let the call through (`allow`); one
     #: that does not apply, or defers, says so here, because None alone cannot.
     gate_note: tuple[str, str | None, str | None] | None = None
+    #: Set by _gate_approval when a human granted the call: the approval to move
+    #: to cancelled if the batch is cancelled before the call is dispatched (#1730).
+    granted_approval_id: str | None = None
 
     def note(self, outcome: str, reason: str | None = None, revision: str | None = None) -> None:
         """Say what the running gate decided, beyond the CallResult or None it returns."""
@@ -865,7 +874,10 @@ def _retry_policy_for(call: Any) -> RetryPolicy | None:
     Two rules decide the result:
 
     * **Config is the ceiling.** An explicit `max_attempts` from the caller can
-      lower the attempt count and never raise it. The operator configures how
+      lower the attempt count and never raise it. An explicit 1 is exactly one
+      attempt, whatever is configured: a caller whose tool is not idempotent has
+      to be able to say so (#1678). Left unsaid (`None`), the configured count
+      applies. The operator configures how
       hard this gateway is willing to lean on an upstream; a caller asking for
       more attempts than that is asking to be someone else's load problem.
     * **No config means no change.** `RetryPolicy()` is three attempts, so
@@ -874,12 +886,14 @@ def _retry_policy_for(call: Any) -> RetryPolicy | None:
       `None` rather than a policy nobody asked for.
     """
     configured = configured_retry_policy(call.mcp_server)
-    caller_attempts = getattr(call, "max_retries", 1) or 1
+    caller_attempts: int | None = getattr(call, "max_retries", None)
 
     if configured is None:
-        return RetryPolicy(max_attempts=caller_attempts) if caller_attempts > 1 else None
+        if caller_attempts is None or caller_attempts <= 1:
+            return None
+        return RetryPolicy(max_attempts=caller_attempts)
 
-    attempts = min(configured.max_attempts, caller_attempts) if caller_attempts > 1 else configured.max_attempts
+    attempts = configured.max_attempts if caller_attempts is None else min(configured.max_attempts, caller_attempts)
     if attempts <= 1:
         return None
     return replace(configured, max_attempts=attempts)
@@ -2162,7 +2176,15 @@ class BatchExecutor:
                     unknown=DigestUnknownPolicy.BLOCK,
                     allowlist=frozenset({pin}),
                 )
-            ).validate_tool(projection.schema, p.call.mcp_server, p.call.call_id, tenant_id=p.caller_tenant_id)
+            ).validate_tool(
+                projection.schema,
+                p.call.mcp_server,
+                p.call.call_id,
+                tenant_id=p.caller_tenant_id,
+                # The upstream that serves the call -- the member a group selected, not
+                # the group -- so a pin bound to another upstream does not hold (#1802).
+                upstream=_upstream_of(p.mcp_server_obj) if pin.upstream is not None else None,
+            )
             blocked = digest_result.blocked
             event = digest_result.event
         except Exception:  # noqa: BLE001 -- a malformed projection schema must not 500 the call path
@@ -2403,6 +2425,7 @@ class BatchExecutor:
             # a tool or tightening a policy while a decision is pending left the
             # held call to dispatch on the superseded decision.
             granted_id = getattr(_approval_loop_local, "approval_id", None)
+            p.granted_approval_id = granted_id
             if granted_id is not None:
                 # Any pin stands for "there is something to re-verify". The
                 # callback re-verifies all of them, the group pins of a member
@@ -2456,6 +2479,36 @@ class BatchExecutor:
             return "not_required"
         return "unavailable" if l7_rule is not None else "not_required"
 
+    def _l7_refuses_without_a_start(self, p: "_CallPipeline") -> bool:
+        """Whether the target's enforced L7 policy will refuse this call, so starting it would be for nothing.
+
+        True for a deny, and for a requireApproval nobody granted: the aggregate
+        raises on both before it wakes the server. Audit mode never refuses, and
+        a call with a pin check still to run is left to start, because that check
+        reads the catalogue the start publishes (#601). Read-only: the verdict the
+        aggregate reaches is the one recorded. The arguments are the call's own;
+        a mutator that rewrites them after this point can only make the aggregate
+        allow what this predicted a refusal for, and the aggregate then starts the
+        server itself.
+        """
+        if p.digest_pin_deferred:
+            return False
+        try:
+            policy = p.governance.l7_policy
+            if policy is None:
+                return False
+            from mcp_hangar.context import get_routing_headers
+            from mcp_hangar.domain.policies.egress_l7 import PolicyMode, ToolAction, evaluate
+
+            if policy.mode is not PolicyMode.ENFORCE:
+                return False
+            action = evaluate(p.call.tool, p.call.arguments or {}, policy, get_routing_headers()).action
+        except Exception:  # noqa: BLE001 -- a prediction must never decide the call: start as before
+            return False
+        if action is ToolAction.DENY:
+            return True
+        return action is ToolAction.REQUIRE_APPROVAL and getattr(_approval_loop_local, "approval_id", None) is None
+
     def _gate_cold_start(self, p: "_CallPipeline") -> CallResult | None:
         """Single-flight cold start of the resolved target.
 
@@ -2474,6 +2527,13 @@ class BatchExecutor:
             refusal = self._refuse_dead_target(p)
             if refusal is not None:
                 return self._report_refusal(p, refusal)
+        if self._l7_refuses_without_a_start(p):
+            # The aggregate refuses this call before it reaches ensure_ready, with
+            # the event and the record a refusal carries. Starting the server here
+            # first made a denied call spawn it and run initialize and tools/list
+            # upstream (#1708).
+            p.note(Gate.SKIP, "l7_refuses")
+            return None
         with p.tracer.start_as_current_span("mcp_server.cold_start") as cs_span:
             # The target the caller named; the member a group selected is the backend (#1286).
             cs_span.set_attribute(McpServer.ID, p.call.mcp_server)
@@ -2533,7 +2593,30 @@ class BatchExecutor:
     def _gate_cancelled_after_cold_start(self, p: "_CallPipeline") -> CallResult | None:
         if not p.cancel_event.is_set():
             return None
+        self._cancel_granted_approval(p)
         return p.refuse("Cancelled after cold start", "CancellationError")
+
+    @staticmethod
+    def _cancel_granted_approval(p: "_CallPipeline") -> None:
+        """Record a granted approval as cancelled when its call is cancelled before dispatch (#1730).
+
+        The grant was published when the hold ended; a call refused after that
+        did not run, and the trail must not read as a grant that took effect.
+        A failure to record it is logged and does not change the refusal.
+        """
+        if p.granted_approval_id is None:
+            return
+        gate_service = getattr(p.ctx, "approval_gate", None)
+        if gate_service is None or not hasattr(gate_service, "cancel_after_grant"):
+            return
+        try:
+            _run_approval_coroutine(gate_service.cancel_after_grant(p.granted_approval_id))
+        except Exception as exc:  # noqa: BLE001 -- the call is already refused; this only annotates the trail
+            logger.warning(
+                "approval_cancel_after_grant_failed",
+                approval_id=p.granted_approval_id,
+                error_type=bounded_error_type(type(exc).__name__),
+            )
 
     def _relay_upstream_task(self, p: "_CallPipeline", result: CallResult) -> CallResult | None:
         """Upstream MCP task handle (ADR-014 P3).
@@ -2721,6 +2804,7 @@ class BatchExecutor:
                     error_type=error_type,
                     elapsed_ms=elapsed_ms,
                     member_outcome=member_outcome(retry_result.final_error),
+                    upstream_result=_upstream_result_of(retry_result.final_error),
                     l7_evaluator_failed=l7 is not None and l7.evaluator_failed,
                     retry_metadata=RetryMetadata(
                         attempts=retry_result.attempt_count,
@@ -2748,6 +2832,7 @@ class BatchExecutor:
                     error_type=error_type,
                     elapsed_ms=elapsed_ms,
                     member_outcome=member_outcome(e),
+                    upstream_result=_upstream_result_of(e),
                     l7_evaluator_failed=l7 is not None and l7.evaluator_failed,
                 )
             else:
@@ -2789,6 +2874,20 @@ class BatchExecutor:
             elapsed_ms=elapsed_ms,
             retry_metadata=retry_meta,
         )
+
+
+def _upstream_result_of(error: BaseException | None) -> dict[str, Any] | None:
+    """The result an upstream sent with ``isError: true``, as the aggregate kept it (#1900).
+
+    Relayed untouched: Hangar neither adds to nor rewrites what the upstream said,
+    and never replaces an upstream's remediation hint with one of its own. A
+    failure Hangar raises itself carries Hangar's reason in ``error``, not here.
+    """
+    details = getattr(error, "details", None)
+    if not isinstance(details, dict) or not details.get("is_error"):
+        return None
+    result = details.get("result")
+    return result if isinstance(result, dict) else None
 
 
 def _remaining_budget(p: _CallPipeline) -> float:
@@ -2991,6 +3090,9 @@ def format_result_dict(result: CallResult) -> dict[str, Any]:
 
     if result.retry_metadata:
         d["retry_metadata"] = result.retry_metadata.to_dict()
+
+    if result.upstream_result is not None:
+        d["upstream_result"] = result.upstream_result
 
     return d
 

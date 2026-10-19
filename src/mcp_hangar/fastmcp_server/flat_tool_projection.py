@@ -57,7 +57,6 @@ from __future__ import annotations
 
 import asyncio
 import functools
-import hashlib
 import json
 import logging
 import uuid
@@ -112,88 +111,34 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# --- SEP-2549 cache-scope advertisement for projected lists (issue #292) ------
+# --- SEP-2549 cache hints on projected lists (issues #292, #1897) -------------
 #
-# SEP-2549 defines ``cacheScope`` / ``ttlMs`` as caching hints on list results so
-# downstream caches know whether — and for how long — a list response may be
-# reused.  ``mcp.types.ListToolsResult`` predates the SEP and has no typed
-# top-level ``cacheScope`` / ``ttlMs`` fields (only ``_meta``/``nextCursor``/
-# ``tools``), so we advertise the hints under the result's ``_meta`` using the
-# SEP-2549 field names.
+# SEP-2549 defines ``cacheScope`` and ``ttlMs`` as top-level fields of every
+# cacheable list result (``CacheableResult`` in the 2026-07-28 schema). Both are
+# typed fields of the SDK's list results, so they are set there and nowhere in
+# ``_meta``, where no client or cache looks.
 #
-# Cross-tenant isolation is the whole point here.  The hangar fronts MANY tenants
-# behind a SINGLE endpoint, and each tenant's ``tools/list`` is a distinct,
-# per-request projection.  SEP-2549's bare ``"private"`` enum relies on the
-# downstream cache correctly keying by authorization context; if it does not, it
-# could serve tenant A's list to tenant B.  To make cross-tenant reuse
-# STRUCTURALLY impossible even for a naive cache that keys only on the advertised
-# scope, we emit a DISTINCT, stable, opaque scope TOKEN per tenant instead of a
-# shared constant.
+# Every projected list is a per-caller projection: the front door fronts many
+# tenants behind one endpoint and filters each list by the caller's tenant and
+# role. The spec's ``"private"`` means exactly "not shared across authorization
+# contexts", so it is the only value a projected list carries; ``"public"`` is
+# for a result identical for every caller, and no projected list is.
 #
-# Fail-closed: when the tenant is unknown (``None``/empty) we emit a unique,
-# non-shareable per-request ``no-store`` token so a cache can never get a second
-# hit on it — never a shared or global scope.
-CACHE_SCOPE_META_KEY = "cacheScope"
-CACHE_TTL_META_KEY = "ttlMs"
-
-# Conservative freshness hint (SEP-2549 ``ttlMs`` is in milliseconds).  Small on
-# purpose: the projection is cheap to rebuild and changes to a tenant's tool
-# surface (withdrawals, policy edits) must propagate quickly.
+# ``ttlMs`` is a ceiling on staleness, not the only freshness signal: a change to
+# what a caller may see also reaches it as ``list_changed``. It is small because
+# a withdrawal or a policy edit must propagate quickly and the projection is
+# cheap to rebuild.
+PROJECTED_LIST_CACHE_SCOPE = "private"
 PROJECTED_LIST_CACHE_TTL_MS = 5_000
 
-# Prefix for real, per-tenant shareable-within-tenant scope tokens.
-_TENANT_SCOPE_PREFIX = "tenant"
-# Prefix for the fail-closed, non-shareable per-request scope tokens.
-_NO_STORE_SCOPE_PREFIX = "no-store"
 
-
-def derive_tenant_cache_scope(tenant_id: str | None) -> str:
-    """Derive a per-tenant SEP-2549 ``cacheScope`` token (pure, unit-testable).
-
-    Properties (relied on by the cross-tenant isolation tests):
-
-    * Two DIFFERENT tenants get DIFFERENT tokens.
-    * The SAME tenant gets the SAME token every time (stable).
-    * It is NEVER a shared/global constant across tenants.
-    * FAIL CLOSED: an unknown tenant (``None`` or empty) yields a unique,
-      non-shareable per-request ``no-store`` token that a cache can never reuse,
-      and which can never equal a real tenant's token.
-
-    The tenant id is hashed so the raw tenant identifier does not leak into the
-    advertised scope; the hash is stable, so the token is stable per tenant.
-
-    Args:
-        tenant_id: The calling tenant's id, or ``None``/empty if unknown.
+def projected_list_cache_hints() -> dict[str, Any]:
+    """The SEP-2549 hints for a projected list, as SDK result field names.
 
     Returns:
-        An opaque, per-tenant (or per-request, when unknown) scope token.
+        ``cache_scope`` and ``ttl_ms``, to be passed to a list result's constructor.
     """
-    if not tenant_id:
-        # Unknown tenant -> narrowest possible scope.  A fresh uuid guarantees
-        # the token is unique to this single response, so any downstream cache
-        # keyed on it can never produce a cross-request (or cross-tenant) hit.
-        return f"{_NO_STORE_SCOPE_PREFIX}:{uuid.uuid4().hex}"
-
-    digest = hashlib.sha256(tenant_id.encode("utf-8")).hexdigest()[:32]
-    return f"{_TENANT_SCOPE_PREFIX}:{digest}"
-
-
-def build_projected_list_cache_meta(tenant_id: str | None) -> dict[str, Any]:
-    """Build the ``_meta`` cache-scope block for a projected list response.
-
-    Attaches the SEP-2549 ``cacheScope`` (per-tenant, fail-closed) and a
-    conservative ``ttlMs`` freshness hint.
-
-    Args:
-        tenant_id: The calling tenant's id, or ``None`` if unknown.
-
-    Returns:
-        A ``_meta`` dict carrying ``cacheScope`` and ``ttlMs``.
-    """
-    return {
-        CACHE_SCOPE_META_KEY: derive_tenant_cache_scope(tenant_id),
-        CACHE_TTL_META_KEY: PROJECTED_LIST_CACHE_TTL_MS,
-    }
+    return {"cache_scope": PROJECTED_LIST_CACHE_SCOPE, "ttl_ms": PROJECTED_LIST_CACHE_TTL_MS}
 
 
 def _member_to_groups() -> dict[str, tuple[str, ...]]:
@@ -389,6 +334,13 @@ def _flat_map_now(
         if not is_governed_allowed(mcp_server, tool_name, kind="tool", tenant_id=tenant_id):
             continue
 
+        # Drifted from a blocking pin on the server or a group that owns it:
+        # withheld until it is re-pinned, so the drifted description never
+        # reaches the model (#1776). Not routed either, so a call reads `-32601`
+        # like any name this caller cannot call (#905).
+        if registry.drifted_pin(tool_name, resolved.digest.sha256, tenant_id, _withdrawal_scopes(mcp_server)):
+            continue
+
         # Shown == callable, and a conforming client drops this one on arrival
         # (#1056). Dropping it here keeps both halves of that invariant: it is
         # absent from the listing and `-32601` on the call.
@@ -534,12 +486,18 @@ def _group_exposure_policies(mcp_server: str) -> list[Any]:
 
 
 def _build_mcp_tool_list(
-    flat_map: dict[str, tuple[str, str]],
+    flat_map: Mapping[str, tuple[str, str]],
+    tenant_id: str | None,
 ) -> list[MCPTool]:
     """Convert the flat map to MCP Tool objects using discovered schemas.
 
+    The definition served is read again here, after the map was built, so the
+    drift check is made again on exactly that definition (#1776): a catalogue
+    rebuilt in between must not put a drifted description on the wire.
+
     Args:
         flat_map: Mapping from flat name to (mcp_server, tool_name).
+        tenant_id: The tenant the map was built for, whose pins apply.
 
     Returns:
         List of MCP Tool objects ready for the tools/list response.
@@ -551,6 +509,9 @@ def _build_mcp_tool_list(
         proj = registry.resolve(mcp_server, tool_name)
         if proj is None:
             continue  # Should not happen after _build_flat_map, but be safe.
+        scopes = _withdrawal_scopes(mcp_server)
+        if registry.drifted_pin(tool_name, proj.digest.sha256, tenant_id, scopes):
+            continue
 
         # Carry the WHOLE definition, renaming only what the flat surface owns.
         # Hand-picking three keys dropped `title`, `annotations`, `execution`,
@@ -558,8 +519,9 @@ def _build_mcp_tool_list(
         # front door had nothing to validate structured output against (#880).
         # `annotations.readOnlyHint` / `destructiveHint` are what a client uses to
         # decide whether a call needs a human in front of it; a projection that
-        # discards them makes every tool look alike.
-        payload = dict(proj.schema)
+        # discards them makes every tool look alike. A tool under a blocking pin
+        # is the exception: only what the pin covers is served.
+        payload = registry.served_definition(proj.schema, tenant_id, scopes)
         payload["name"] = flat_name
         payload.setdefault("description", "")
         payload.setdefault("inputSchema", {"type": "object", "properties": {}})
@@ -644,7 +606,7 @@ def generate_projection(tenant_id: str | None) -> Projection:
     the per-POST memo and the cache-scope meta stay there too.
     """
     routes = _build_flat_map(tenant_id)
-    tools = _build_mcp_tool_list(routes)
+    tools = _build_mcp_tool_list(routes, tenant_id)
     return Projection(
         tenant_id=tenant_id,
         routes=MappingProxyType(routes),
@@ -758,6 +720,82 @@ def _memoise_flat_map(mcp_ctx: Any, projection: Projection) -> None:
     state = getattr(_http_request(mcp_ctx), "state", None)
     if state is not None:
         setattr(state, _MEMO_ATTR, projection)
+
+
+def projected_input_schema(name: str) -> Mapping[str, Any] | None:
+    """The input schema the front door serves for the tool *name*, or ``None``.
+
+    The SDK's ``get_tool_input_schema`` hook (mcp 2.3.0): it resolves the schema
+    a ``tools/call``'s ``Mcp-Param-*`` headers are checked against, from the name
+    alone and before any middleware, so it knows no caller. 2.3.0 no longer runs
+    the ``tools/list`` handler for it, and the SDK's own lookup only knows the
+    tools its tool manager holds -- not one of the projected upstream tools. The
+    headers of a call to one were never compared with its body (#1791).
+
+    Flat names are tool names (no server prefix) and a schema does not depend on
+    the tenant, so the answer is the same for every caller. Two cases answer
+    ``None``, which skips the SDK's check and leaves the per-caller one in
+    `_validated_param_headers`: a name more than one server serves with
+    different schemas, and a tool whose ``x-mcp-header`` annotations the front
+    door withholds (such a call is ``-32601`` regardless).
+    """
+    registry = get_tool_projection_registry()
+    schemas: list[Mapping[str, Any]] = []
+    for raw in registry.all():
+        if raw.tool != name:
+            continue
+        resolved = registry.resolve(raw.mcp_server, raw.tool)
+        if resolved is None or _invalid_header_annotation(resolved) is not None:
+            return None
+        schema = resolved.schema.get("inputSchema")
+        if isinstance(schema, Mapping):
+            schemas.append(schema)
+    if not schemas or any(candidate != schemas[0] for candidate in schemas[1:]):
+        return None
+    return schemas[0]
+
+
+def _install_projected_schema_lookup(low: Any) -> None:
+    """Make the SDK check ``Mcp-Param-*`` against projected tools' schemas (mcp 2.3.0, #1791).
+
+    2.3.0 resolves the schema through ``Server.get_tool_input_schema``, a plain
+    instance attribute, and not through the ``tools/list`` handler. The SDK's own
+    answer stays the fallback for the ``hangar_*`` management tools it registered
+    itself. Absent on 2.0.0, which lists instead: nothing to install.
+    """
+    if not hasattr(low, "get_tool_input_schema"):
+        return
+    sdk_input_schema = low.get_tool_input_schema
+
+    def _input_schema_for(name: str) -> Mapping[str, Any] | None:
+        projected = projected_input_schema(name)
+        if projected is not None:
+            return projected
+        return sdk_input_schema(name) if sdk_input_schema is not None else None
+
+    low.get_tool_input_schema = _input_schema_for
+
+
+async def _list_if_the_sdk_did_not(mcp_ctx: Any, load_management: Any) -> None:
+    """Run the pre-dispatch listing mcp 2.0.0 ran and 2.3.0 does not (#1791).
+
+    That listing left the per-POST memo and the schema
+    `_record_validated_param_headers` reads (#1049, #1597). The same code runs
+    here, so what follows reads the same facts. A failed listing has already
+    marked the POST as unchecked; it must not fail the call, as the SDK's
+    fail-open lookup did not.
+    """
+    if not _call_carries_param_check(mcp_ctx) or _listing_ran_on_this_post(mcp_ctx):
+        return
+    try:
+        await _list_projected_tools(mcp_ctx, load_management)
+    except Exception:  # noqa: BLE001 -- marked skipped by the listing; the required guard decides
+        return
+
+
+def _listing_ran_on_this_post(mcp_ctx: Any) -> bool:
+    """Whether the SDK listed the tools before dispatching this POST (mcp 2.0.0), leaving the memo."""
+    return getattr(getattr(_http_request(mcp_ctx), "state", None), _MEMO_ATTR, None) is not None
 
 
 def _mark_param_validation_skipped(mcp_ctx: Any) -> None:
@@ -877,7 +915,7 @@ async def _list_projected_tools(mcp_ctx: Any, load_management: Any) -> ListTools
     _memoise_flat_map(mcp_ctx, projection)
     return ListToolsResult(
         tools=governed + management,
-        _meta=build_projected_list_cache_meta(tenant_id),
+        **projected_list_cache_hints(),
     )
 
 
@@ -1073,6 +1111,27 @@ def _refusing_suspended_sessions(call_tool: Callable[..., Awaitable[Any]]) -> Ca
     return guarded
 
 
+def _failed_flat_result(error: str | None, upstream_result: dict[str, Any] | None) -> Any:
+    """The tool result for a flat call that did not succeed.
+
+    An upstream that reported its own failure is owed its answer back as sent: its
+    ``_meta`` envelopes, structured content and every content block reach the
+    caller untouched (#1900). Any other failure, and an upstream answer that
+    cannot be carried as a tool result, is Hangar's error text with
+    ``isError=True``, so the MCP envelope stays valid.
+    """
+    from mcp_hangar._sdk_compat import CallToolResult
+
+    if upstream_result is not None:
+        try:
+            return CallToolResult.model_validate({**upstream_result, "isError": True})
+        except ValueError:
+            logger.warning("upstream_failure_result_not_relayable", exc_info=True)
+    return CallToolResult.model_validate(
+        {"content": [{"type": "text", "text": error or "tool call failed"}], "isError": True}
+    )
+
+
 def register_flat_tool_handlers(mcp: FastMCP) -> None:
     """Replace the default tools/list and tools/call handlers with flat-projection ones.
 
@@ -1106,7 +1165,8 @@ def register_flat_tool_handlers(mcp: FastMCP) -> None:
         permitted = management_tools_for(mcp_ctx)
         if not permitted:
             return []
-        registered = mcp.list_tools()
+        # Awaited on SDK v2, a plain list on v1; typed Any so neither is a lie to mypy.
+        registered: Any = mcp.list_tools()
         if hasattr(registered, "__await__"):
             registered = await registered
         return [tool for tool in registered if tool.name in permitted]
@@ -1126,10 +1186,9 @@ def register_flat_tool_handlers(mcp: FastMCP) -> None:
         an agent without a control plane and an operator with one -- the reason
         the mode-wide swap was not enough (ADR-022).
 
-        The response advertises a per-tenant SEP-2549 ``cacheScope`` under
-        ``_meta`` (fail-closed to a non-shareable ``no-store`` token when the
-        tenant is unknown) so a downstream cache can never serve one tenant's
-        list to another (issue #292).
+        The response carries the SEP-2549 ``cacheScope: "private"`` and ``ttlMs``
+        at the top level, so a downstream cache never serves one caller's list to
+        another (issues #292, #1897).
         """
         return await _list_projected_tools(mcp_ctx, _management_tools)
 
@@ -1296,14 +1355,7 @@ def register_flat_tool_handlers(mcp: FastMCP) -> None:
         result, created_task = govern_flat_call(batch.results)
         if not result.success:
             note_failure(result.error_type)  # the text below does not carry the code; the log line does
-            # Surface enforcement failures as tool errors (isError=True),
-            # not as unhandled exceptions, so the MCP envelope stays valid.
-            return CallToolResult.model_validate(
-                {
-                    "content": [{"type": "text", "text": result.error or "tool call failed"}],
-                    "isError": True,
-                }
-            )
+            return _failed_flat_result(result.error, result.upstream_result)
 
         # Namespace every resource URI we are about to hand this tenant with its
         # owning upstream, and remember the resource_links, so following one on
@@ -1358,6 +1410,13 @@ def register_flat_tool_handlers(mcp: FastMCP) -> None:
 
         async def _call_v2(ctx: Any, params: Any) -> Any:
             token = bind_caller_identity(ctx)
+            # mcp 2.0.0 listed the tools before dispatching a call, to resolve the
+            # Mcp-Param schema (#1049), and that listing left the memo and the
+            # schema `_record_validated_param_headers` reads. 2.3.0 does not list:
+            # run it here, the same code, so what follows reads the same facts
+            # (#1791). A failed listing marked the POST as unchecked; it must
+            # not fail the call, as the SDK did not.
+            await _list_if_the_sdk_did_not(ctx, _management_tools)
             # The L7 egress evaluator selects on Mcp-Param-* (#1058), and the
             # aggregate that runs it is several frames and one worker thread
             # away; this is the last place the HTTP request is in hand.
@@ -1378,6 +1437,7 @@ def register_flat_tool_handlers(mcp: FastMCP) -> None:
         async def _call_v2_inner(params: Any, ctx: Any) -> Any:
             return await logged_call(params.name, params.arguments or {}, ctx)
 
+        _install_projected_schema_lookup(low)
         low.add_request_handler("tools/list", PaginatedRequestParams, _list_v2)
         low.add_request_handler("tools/call", CallToolRequestParams, _call_v2)
 
